@@ -15,124 +15,121 @@
  */
 package dev.morling.onebrc;
 
+import sun.misc.Unsafe;
+
+import java.io.BufferedOutputStream;
 import java.io.IOException;
-import java.nio.MappedByteBuffer;
+import java.lang.foreign.Arena;
+import java.lang.reflect.Field;
 import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.util.*;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.TreeMap;
 
 public class CalculateAverage_zerninv {
     private static final String FILE = "./measurements.txt";
-    private static final int MIN_FILE_SIZE = 1024 * 1024;
-    private static final char DELIMITER = ';';
-    private static final char LINE_SEPARATOR = '\n';
-    private static final char ZERO = '0';
-    private static final char NINE = '9';
-    private static final char MINUS = '-';
+    private static final int L3_CACHE_SIZE = 128 * 1024 * 1024;
+    private static final int CORES = Runtime.getRuntime().availableProcessors();
+    private static final int CHUNK_SIZE = (L3_CACHE_SIZE - MeasurementContainer.SIZE * MeasurementContainer.ENTRY_SIZE * CORES) / CORES - 1024 * CORES;
 
-    public static void main(String[] args) throws IOException {
-        var results = new HashMap<String, MeasurementAggregation>();
+    // #.##
+    private static final int THREE_DIGITS_MASK = 0x2e0000;
+    // #.#
+    private static final int TWO_DIGITS_MASK = 0x2e00;
+    // #.#-
+    private static final int TWO_NEGATIVE_DIGITS_MASK = 0x2e002d;
+    private static final int BYTE_MASK = 0xff;
+    private static final int ZERO = '0';
+
+    private static final byte DELIMITER = ';';
+    private static final byte LINE_SEPARATOR = '\n';
+
+    private static final Unsafe UNSAFE = initUnsafe();
+
+    public static void main(String[] args) throws IOException, InterruptedException {
         try (var channel = FileChannel.open(Path.of(FILE), StandardOpenOption.READ)) {
             var fileSize = channel.size();
-            var cores = Runtime.getRuntime().availableProcessors();
-            var chunks = cores - 1;
-            var maxChunkSize = fileSize < MIN_FILE_SIZE ? fileSize : Math.min(fileSize / chunks, Integer.MAX_VALUE);
-            var chunkOffsets = splitByChunks(channel, maxChunkSize);
+            var minChunkSize = Math.min(fileSize, CHUNK_SIZE);
 
-            var executor = Executors.newFixedThreadPool(cores);
-            List<Future<Map<String, MeasurementAggregation>>> fResults = new ArrayList<>();
-            for (int i = 1; i < chunkOffsets.size(); i++) {
-                final long prev = chunkOffsets.get(i - 1);
-                final long curr = chunkOffsets.get(i);
-                fResults.add(executor.submit(() -> calcForChunk(channel, prev, curr)));
+            var tasks = new TaskThread[CORES];
+            for (int i = 0; i < tasks.length; i++) {
+                tasks[i] = new TaskThread(new MeasurementContainer(), (int) (fileSize / minChunkSize / CORES + 1));
             }
 
-            fResults.forEach(f -> {
-                try {
-                    f.get().forEach((key, value) -> {
-                        var result = results.get(key);
-                        if (result != null) {
-                            result.merge(value);
-                        }
-                        else {
-                            results.put(key, value);
-                        }
-                    });
-                }
-                catch (InterruptedException | ExecutionException e) {
-                    e.printStackTrace();
-                }
-            });
-            executor.shutdown();
+            var memorySegment = channel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.global());
+            var address = memorySegment.address();
+            var chunks = splitByChunks(address, address + fileSize, minChunkSize);
+            for (int i = 0; i < chunks.size() - 1; i++) {
+                var task = tasks[i % CORES];
+                task.addChunk(chunks.get(i), chunks.get(i + 1));
+            }
+
+            for (var task : tasks) {
+                task.start();
+            }
+
+            var results = new TreeMap<String, TemperatureAggregation>();
+            for (var task : tasks) {
+                task.join();
+                task.measurements()
+                        .forEach(measurement -> {
+                            var aggr = results.get(measurement.station());
+                            if (aggr == null) {
+                                results.put(measurement.station(), measurement.aggregation());
+                            }
+                            else {
+                                aggr.merge(measurement.aggregation());
+                            }
+                        });
+            }
+
+            var bos = new BufferedOutputStream(System.out);
+            bos.write(new TreeMap<>(results).toString().getBytes(StandardCharsets.UTF_8));
+            bos.write('\n');
+            bos.flush();
         }
-        System.out.println(new TreeMap<>(results));
     }
 
-    private static List<Long> splitByChunks(FileChannel channel, long maxChunkSize) throws IOException {
-        long size = channel.size();
-        List<Long> result = new ArrayList<>();
-        long current = 0;
-        result.add(current);
-        while (current < size) {
-            var mbb = channel.map(FileChannel.MapMode.READ_ONLY, current, Math.min(size - current, maxChunkSize));
-            int position = mbb.limit() - 1;
-            while (mbb.get(position) != LINE_SEPARATOR) {
-                position--;
+    private static Unsafe initUnsafe() {
+        try {
+            Field unsafe = Unsafe.class.getDeclaredField("theUnsafe");
+            unsafe.setAccessible(true);
+            return (Unsafe) unsafe.get(Unsafe.class);
+        }
+        catch (IllegalAccessException | NoSuchFieldException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static List<Long> splitByChunks(long address, long end, long minChunkSize) {
+        List<Long> result = new ArrayList<>((int) ((end - address) / minChunkSize + 1));
+        result.add(address);
+        while (address < end) {
+            address += Math.min(end - address, minChunkSize);
+            while (address < end && UNSAFE.getByte(address++) != LINE_SEPARATOR) {
             }
-            current += position + 1;
-            result.add(current);
+            result.add(address);
         }
         return result;
     }
 
-    private static Map<String, MeasurementAggregation> calcForChunk(FileChannel channel, long begin, long end) throws IOException {
-        var mbb = channel.map(FileChannel.MapMode.READ_ONLY, begin, end - begin);
-        var results = new MeasurementContainer(mbb);
-        int cityOffset, cityNameSize, hashCode, temperatureOffset, temperature;
-        byte b;
-
-        while (mbb.hasRemaining()) {
-            cityOffset = mbb.position();
-            hashCode = 0;
-            while ((b = mbb.get()) != DELIMITER) {
-                hashCode = 31 * hashCode + b;
-            }
-
-            temperatureOffset = mbb.position();
-            cityNameSize = temperatureOffset - cityOffset - 1;
-
-            temperature = 0;
-            while ((b = mbb.get()) != LINE_SEPARATOR) {
-                if (b >= ZERO && b <= NINE) {
-                    temperature = temperature * 10 + (b - ZERO);
-                }
-            }
-            if (mbb.get(temperatureOffset) == MINUS) {
-                temperature *= -1;
-            }
-            results.put(cityOffset, cityNameSize, hashCode, (short) temperature);
-        }
-        return results.toStringMap();
-    }
-
-    private static final class MeasurementAggregation {
+    private static final class TemperatureAggregation {
         private long sum;
         private int count;
         private short min;
         private short max;
 
-        public MeasurementAggregation(long sum, int count, short min, short max) {
+        public TemperatureAggregation(long sum, int count, short min, short max) {
             this.sum = sum;
             this.count = count;
             this.min = min;
             this.max = max;
         }
 
-        public void merge(MeasurementAggregation o) {
+        public void merge(TemperatureAggregation o) {
             if (o == null) {
                 return;
             }
@@ -148,79 +145,160 @@ public class CalculateAverage_zerninv {
         }
     }
 
+    private record Measurement(String station, TemperatureAggregation aggregation) {
+    }
+
     private static final class MeasurementContainer {
         private static final int SIZE = 1024 * 16;
 
-        private final MappedByteBuffer mbb;
-        private final int[] offsets = new int[SIZE];
-        private final int[] sizes = new int[SIZE];
-        private final int[] hashes = new int[SIZE];
+        private static final int ENTRY_SIZE = 4 + 4 + 1 + 8 + 8 + 2 + 2;
+        private static final int COUNT_OFFSET = 0;
+        private static final int HASH_OFFSET = 4;
+        private static final int SIZE_OFFSET = 8;
+        private static final int ADDRESS_OFFSET = 9;
+        private static final int SUM_OFFSET = 17;
+        private static final int MIN_OFFSET = 25;
+        private static final int MAX_OFFSET = 27;
 
-        private final long[] sums = new long[SIZE];
-        private final int[] counts = new int[SIZE];
-        private final short[] mins = new short[SIZE];
-        private final short[] maxs = new short[SIZE];
+        private final long address;
 
-        private MeasurementContainer(MappedByteBuffer mbb) {
-            this.mbb = mbb;
-            Arrays.fill(mins, Short.MAX_VALUE);
-            Arrays.fill(maxs, Short.MIN_VALUE);
-        }
-
-        public void put(int offset, int size, int hash, short value) {
-            int i = findIdx(offset, size, hash);
-            offsets[i] = offset;
-            sizes[i] = size;
-            hashes[i] = hash;
-
-            sums[i] += value;
-            counts[i]++;
-
-            if (value < mins[i]) {
-                mins[i] = value;
-            }
-            if (value > maxs[i]) {
-                maxs[i] = value;
+        private MeasurementContainer() {
+            address = UNSAFE.allocateMemory(ENTRY_SIZE * SIZE);
+            UNSAFE.setMemory(address, ENTRY_SIZE * SIZE, (byte) 0);
+            for (long ptr = address; ptr < address + SIZE * ENTRY_SIZE; ptr += ENTRY_SIZE) {
+                UNSAFE.putShort(ptr + MIN_OFFSET, Short.MAX_VALUE);
+                UNSAFE.putShort(ptr + MAX_OFFSET, Short.MIN_VALUE);
             }
         }
 
-        public Map<String, MeasurementAggregation> toStringMap() {
-            var result = new HashMap<String, MeasurementAggregation>();
+        public void put(long address, byte size, int hash, short value) {
+            int idx = Math.abs(hash % SIZE);
+            long ptr = this.address + idx * ENTRY_SIZE;
+            int count;
+
+            while ((count = UNSAFE.getInt(ptr + COUNT_OFFSET)) != 0) {
+                if (UNSAFE.getInt(ptr + HASH_OFFSET) == hash
+                        && UNSAFE.getByte(ptr + SIZE_OFFSET) == size
+                        && isEqual(UNSAFE.getLong(ptr + ADDRESS_OFFSET), address, size)) {
+                    break;
+                }
+                idx = (idx + 1) % SIZE;
+                ptr = this.address + idx * ENTRY_SIZE;
+            }
+
+            UNSAFE.putInt(ptr + COUNT_OFFSET, count + 1);
+            UNSAFE.putInt(ptr + HASH_OFFSET, hash);
+            UNSAFE.putByte(ptr + SIZE_OFFSET, size);
+            UNSAFE.putLong(ptr + ADDRESS_OFFSET, address);
+
+            UNSAFE.putLong(ptr + SUM_OFFSET, UNSAFE.getLong(ptr + SUM_OFFSET) + value);
+            if (value < UNSAFE.getShort(ptr + MIN_OFFSET)) {
+                UNSAFE.putShort(ptr + MIN_OFFSET, value);
+            }
+            if (value > UNSAFE.getShort(ptr + MAX_OFFSET)) {
+                UNSAFE.putShort(ptr + MAX_OFFSET, value);
+            }
+        }
+
+        public List<Measurement> measurements() {
+            var result = new ArrayList<Measurement>(1000);
+            int count;
             for (int i = 0; i < SIZE; i++) {
-                if (counts[i] != 0) {
-                    var key = createString(offsets[i], sizes[i]);
-                    result.put(key, new MeasurementAggregation(sums[i], counts[i], mins[i], maxs[i]));
+                long ptr = this.address + i * ENTRY_SIZE;
+                count = UNSAFE.getInt(ptr + COUNT_OFFSET);
+                if (count != 0) {
+                    var measurements = new TemperatureAggregation(
+                            UNSAFE.getLong(ptr + SUM_OFFSET),
+                            count,
+                            UNSAFE.getShort(ptr + MIN_OFFSET),
+                            UNSAFE.getShort(ptr + MAX_OFFSET));
+                    var key = createString(UNSAFE.getLong(ptr + ADDRESS_OFFSET), UNSAFE.getByte(ptr + SIZE_OFFSET));
+                    result.add(new Measurement(key, measurements));
                 }
             }
             return result;
         }
 
-        private int findIdx(int offset, int size, int hash) {
-            int i = Math.abs(hash % SIZE);
-            while (counts[i] != 0) {
-                if (hashes[i] == hash && sizes[i] == size && isEqual(i, offset)) {
-                    break;
-                }
-                i = (i + 1) % SIZE;
-            }
-            return i;
-        }
-
-        private boolean isEqual(int index, int offset) {
-            for (int i = 0; i < sizes[index]; i++) {
-                if (mbb.get(offsets[index] + i) != mbb.get(offset + i)) {
+        private static boolean isEqual(long address, long address2, byte size) {
+            for (int i = 0; i < size; i++) {
+                if (UNSAFE.getByte(address + i) != UNSAFE.getByte(address2 + i)) {
                     return false;
                 }
             }
             return true;
         }
 
-        private String createString(int offset, int size) {
+        private String createString(long address, byte size) {
             byte[] arr = new byte[size];
             for (int i = 0; i < size; i++) {
-                arr[i] = mbb.get(offset + i);
+                arr[i] = UNSAFE.getByte(address + i);
             }
             return new String(arr);
+        }
+    }
+
+    private static class TaskThread extends Thread {
+        private final MeasurementContainer container;
+        private final List<Long> begins;
+        private final List<Long> ends;
+
+        private TaskThread(MeasurementContainer container, int chunks) {
+            this.container = container;
+            this.begins = new ArrayList<>(chunks);
+            this.ends = new ArrayList<>(chunks);
+        }
+
+        public void addChunk(long begin, long end) {
+            begins.add(begin);
+            ends.add(end);
+        }
+
+        @Override
+        public void run() {
+            for (int i = 0; i < begins.size(); i++) {
+                calcForChunk(begins.get(i), ends.get(i));
+            }
+        }
+
+        public List<Measurement> measurements() {
+            return container.measurements();
+        }
+
+        private void calcForChunk(long offset, long end) {
+            long cityOffset;
+            int hashCode, temperature, word;
+            byte cityNameSize, b;
+
+            while (offset < end) {
+                cityOffset = offset;
+                hashCode = 0;
+                while ((b = UNSAFE.getByte(offset++)) != DELIMITER) {
+                    hashCode = hashCode * 31 + b;
+                }
+                cityNameSize = (byte) (offset - cityOffset - 1);
+
+                word = UNSAFE.getInt(offset);
+                offset += 4;
+
+                if ((word & TWO_NEGATIVE_DIGITS_MASK) == TWO_NEGATIVE_DIGITS_MASK) {
+                    word >>>= 8;
+                    temperature = ZERO * 11 - ((word & BYTE_MASK) * 10 + ((word >>> 16) & BYTE_MASK));
+                }
+                else if ((word & THREE_DIGITS_MASK) == THREE_DIGITS_MASK) {
+                    temperature = (word & BYTE_MASK) * 100 + ((word >>> 8) & BYTE_MASK) * 10 + ((word >>> 24) & BYTE_MASK) - ZERO * 111;
+                }
+                else if ((word & TWO_DIGITS_MASK) == TWO_DIGITS_MASK) {
+                    temperature = (word & BYTE_MASK) * 10 + ((word >>> 16) & BYTE_MASK) - ZERO * 11;
+                    offset--;
+                }
+                else {
+                    // #.##-
+                    word = (word >>> 8) | (UNSAFE.getByte(offset++) << 24);
+                    temperature = ZERO * 111 - ((word & BYTE_MASK) * 100 + ((word >>> 8) & BYTE_MASK) * 10 + ((word >>> 24) & BYTE_MASK));
+                }
+                offset++;
+                container.put(cityOffset, cityNameSize, hashCode, (short) temperature);
+            }
         }
     }
 }
